@@ -1,17 +1,18 @@
 #!/home/al/local/AI-tools/surya-api/.venv/bin/python
 # -*- coding: utf-8 -*-
 
-import fcntl
 from typing import Optional
 from filelock import FileLock, Timeout
 import logging.config
 import copy
+import sys
 
 from fastapi import FastAPI, File, UploadFile, Query, Path, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import io
+import subprocess
 # import pathlib
 import argparse
 from time import perf_counter
@@ -23,18 +24,20 @@ import asyncio
 from pydantic import BaseModel
 
 from crown.table_rec import TableExtPredictor
-from crown.utils import crop_by_percent, get_page_image
+from crown.utils import crop_by_percent, crop_by_side_percent, get_page_image
 from crown.utils import poligon_expand
-from crown.utils import trim_noisy_background
+from crown.utils import trim_empty_background
 from surya.layout.schema import LayoutBox, LayoutResult
 from surya.recognition.schema import PageOCRResult
 from surya.settings import settings
-from surya.inference import SuryaInferenceManager
+from crown.inference import ApiInferenceManager
 from surya.recognition import RecognitionPredictor
 
 # from surya.detection import DetectionPredictor
 from surya.layout import LayoutPredictor
 from surya.logging import get_logger
+import httpx
+import surya.inference.backends.spawn as spawn_module
 from surya.inference.backends.spawn import (
     _cache_dir,
     _lock_path,
@@ -43,8 +46,30 @@ from surya.inference.backends.spawn import (
     _delete_sentinel,
     _stop_docker_container,
     _stop_process,
-    probe_health,
 )
+
+# Localhost must bypass system proxy (Windows SOCKS/HTTP proxy breaks Docker /health).
+os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
+os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
+
+
+def _patch_openai_no_system_proxy() -> None:
+    """OpenAI uses httpx with trust_env=True; SOCKS proxies break localhost vLLM."""
+    from openai import OpenAI
+
+    if getattr(OpenAI, "_surya_api_trust_env_false", False):
+        return
+    _orig_init = OpenAI.__init__
+
+    def _init(self, *args, **kwargs):
+        kwargs.setdefault("http_client", httpx.Client(trust_env=False))
+        _orig_init(self, *args, **kwargs)
+
+    OpenAI.__init__ = _init  # type: ignore[method-assign]
+    OpenAI._surya_api_trust_env_false = True
+
+
+_patch_openai_no_system_proxy()
 
 from contextlib import asynccontextmanager
 
@@ -53,6 +78,7 @@ from anyio import CapacityLimiter
 
 from surya.table_rec import TableRecPredictor
 from surya.table_rec.schema import TableCell, TableCol, TableResult, TableRow
+import portalocker
 
 
 logger = get_logger()
@@ -121,10 +147,94 @@ def get_request_count() -> tuple[int, float | None, int | None]:
             return (
                 data.get("request_count", 0),
                 data.get("last_updated"),
-                data.get("port", 0),
+                data.get("port"),
             )
     except Timeout:
         return 0, None, None
+
+
+def probe_inference_health(base_url: str, timeout: float = 5.0) -> bool:
+    """Probe vLLM /health; trust_env=False avoids proxy hijacking localhost."""
+    url = f"{base_url.rstrip('/')}/health"
+    try:
+        with httpx.Client(timeout=timeout, trust_env=False) as client:
+            r = client.get(url)
+            if r.status_code == 200:
+                return True
+            logger.warning("Health check %s returned HTTP %s", url, r.status_code)
+    except Exception as exc:
+        logger.warning("Health check %s failed: %s", url, exc)
+    return False
+
+
+# Surya's spawn loop uses the same probe; patch so start() benefits too.
+spawn_module.probe_health = lambda base_url, timeout=1.0: probe_inference_health(
+    base_url, timeout=max(timeout, 5.0)
+)
+
+
+def _backend_handle():
+    """ServerHandle from the active backend — only set after backend.start() succeeds."""
+    return getattr(inference_manager.backend, "handle", None)
+
+
+def _backend_client():
+    return getattr(inference_manager.backend, "_client", None)
+
+
+def _repair_openai_client_if_needed() -> None:
+    """VllmBackend.start() returns early when handle exists, even if _client is None."""
+    backend = inference_manager.backend
+    handle = getattr(backend, "handle", None)
+    if handle is None or getattr(backend, "_client", None) is not None:
+        return
+    from openai import OpenAI
+
+    logger.info("Repairing missing OpenAI client for inference backend")
+    backend._client = OpenAI(
+        api_key=settings.VLLM_API_KEY,
+        base_url=handle.base_url,
+        http_client=httpx.Client(trust_env=False),
+    )
+
+
+def _handle_health_url(handle) -> str:
+    base = handle.base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return base
+
+
+async def ensure_inference_server() -> None:
+    """Ensure the inference backend is connected.
+
+    backend.handle is None until start() finishes — that is normal before the
+    first OCR request. The backend's start() owns the full container lifecycle
+    (create / start / recreate-on-unhealthy with a retry cap), so here we only
+    decide whether to (re)connect.
+    """
+    handle = _backend_handle()
+    client = _backend_client()
+    if handle is not None and client is not None:
+        if probe_inference_health(_handle_health_url(handle)):
+            return
+        logger.info("Stale inference handle; reconnecting")
+        inference_manager.stop()
+    elif handle is not None and client is None:
+        logger.info("Inference handle without OpenAI client; reconnecting")
+        inference_manager.stop()
+    await asyncio.to_thread(inference_manager.start)
+    _repair_openai_client_if_needed()
+    if _backend_handle() is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Inference server failed to start (no backend handle).",
+        )
+    if _backend_client() is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Inference server failed to start (no OpenAI client).",
+        )
 
 
 def cleanup():
@@ -149,6 +259,12 @@ def cleanup():
     logger.info("Cleanup complete.")
 
 
+def release_inference_on_idle() -> None:
+    """Stop the inference container on idle while keeping it for fast restart."""
+    inference_manager.stop()
+    cleanup()
+
+
 async def resource_management_loop():
     try:
         timer = 60.0
@@ -161,12 +277,11 @@ async def resource_management_loop():
                 and (perf_counter() - last_updated) > timer
             ):
                 logger.warning(
-                    f"No requests in the last {int(timer)} seconds; stopping inference server to save resources."
+                    f"No requests in the last {int(timer)} seconds; stopping inference container (persistent, will restart on next request)."
                 )
-                cleanup()
+                release_inference_on_idle()
     except asyncio.CancelledError:
         pass
-    cleanup()
 
 
 @asynccontextmanager
@@ -175,15 +290,15 @@ async def lifespan(app: FastAPI):
     RunVar("_default_thread_limiter").set(CapacityLimiter(10))
 
     # Open or create the lock file
-    file_descriptor = os.open(LOCK_FILE, os.O_CREAT | os.O_WRONLY)
+    lock_file = open(LOCK_FILE, "w")
     background_task = None
 
     try:
         # Attempt non-blocking exclusive lock
-        fcntl.flock(file_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        portalocker.lock(lock_file, portalocker.LOCK_EX | portalocker.LOCK_NB)
         print("Server starting...")
         background_task = asyncio.create_task(resource_management_loop())
-    except BlockingIOError:
+    except portalocker.LockException:
         # Another worker process already has the lock
         pass
 
@@ -193,13 +308,43 @@ async def lifespan(app: FastAPI):
     if background_task:
         background_task.cancel()
     try:
-        fcntl.flock(file_descriptor, fcntl.LOCK_UN)
-        os.close(file_descriptor)
+        portalocker.unlock(lock_file)
+        lock_file.close()
     except Exception:
         pass
 
     # atexit._run_exitfuncs()
     print("Done")
+
+
+def load_and_preprocess_image(
+    file: UploadFile,
+    dpi: int | None,
+    trim: float,
+    crop: float,
+    crop_left: float = 0.0,
+    crop_right: float = 0.0,
+    crop_top: float = 0.0,
+    crop_bottom: float = 0.0,
+) -> Image.Image:
+    """Load PDF/image upload and apply shared trim/crop preprocessing."""
+    if file.content_type == "application/pdf":
+        image = get_page_image(file, page_num=1, dpi=dpi or 300)
+    else:
+        image = Image.open(file.file).convert("RGB")
+    if trim > 0.0:
+        image = trim_empty_background(image, threshold=trim)
+    if crop_left or crop_right or crop_top or crop_bottom:
+        image = crop_by_side_percent(
+            image,
+            left=crop_left or crop,
+            right=crop_right or crop,
+            top=crop_top or crop,
+            bottom=crop_bottom or crop,
+        )
+    elif crop > 0.0:
+        image = crop_by_percent(image, crop)
+    return image
 
 
 # Initialize FastAPI
@@ -216,7 +361,7 @@ app.add_middleware(
 
 
 # Load models once when the application starts
-inference_manager = SuryaInferenceManager()
+inference_manager = ApiInferenceManager()
 
 
 @app.post("/ocr/full/")
@@ -227,11 +372,41 @@ async def ocr_full_page(file: UploadFile = File(...),
         le=600,
         description="Optional: DPI for rendering PDF pages to images. Higher DPI can improve OCR accuracy but increases processing time and memory usage. 300 (the default) is a common choice for good quality OCR."
         ),
+    trim: float = Query(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Entropy threshold to trim empty/solid borders before OCR. 0 disables trimming; 0.2–0.5 recommended."
+        ),
     crop: float = Query(
         default=0.0,
         ge=0.0,
         le=50.0,
         description="Optional percent to crop from each side of the image before OCR. Can help with noisy borders that can provoke hallucinations. 0 means no cropping, 50 means crop half of the image from each side, 0.2 .. 0.5 recommended value."
+        ),
+    crop_left: float = Query(
+        default=0.0,
+        ge=0.0,
+        le=50.0,
+        description="Percent to crop from the LEFT side; overrides crop for that side when non-zero."
+        ),
+    crop_right: float = Query(
+        default=0.0,
+        ge=0.0,
+        le=50.0,
+        description="Percent to crop from the RIGHT side; overrides crop for that side when non-zero."
+        ),
+    crop_top: float = Query(
+        default=0.0,
+        ge=0.0,
+        le=50.0,
+        description="Percent to crop from the TOP side; overrides crop for that side when non-zero."
+        ),
+    crop_bottom: float = Query(
+        default=0.0,
+        ge=0.0,
+        le=50.0,
+        description="Percent to crop from the BOTTOM side; overrides crop for that side when non-zero."
         ),
     ):
     """Full-page OCR that extracts text and returns structured HTML.
@@ -245,28 +420,19 @@ async def ocr_full_page(file: UploadFile = File(...),
             f"Received file: {file.filename}, content_type: {file.content_type}"
         )
         recognizer = RecognitionPredictor(inference_manager)
-        _, last_updated, port = get_request_count()
-        if (
-            last_updated is None
-            or port is None
-            or not probe_health(f"http://{settings.SURYA_INFERENCE_HOST}:{port}")
-        ):
-            inference_manager.stop()
-            inference_manager.start()
+        await ensure_inference_server()
         update_request_count()
         start_time = perf_counter()
-        if file.content_type == "application/pdf":
-            # For PDFs, render the first page to an image for OCR
-            # pdf_path = pathlib.Path(f"/tmp/{file.filename}")
-            # with open(pdf_path, "wb") as f:
-            #     f.write(file.file.read())
-            image = get_page_image(file, page_num=1, dpi=dpi)
-            # os.remove(pdf_path)
-        else:
-            image = Image.open(file.file)
-        image = trim_noisy_background(image)
-        if crop > 0.0:
-            image = crop_by_percent(image, crop)
+        image = load_and_preprocess_image(
+            file,
+            dpi=dpi,
+            trim=trim,
+            crop=crop,
+            crop_left=crop_left,
+            crop_right=crop_right,
+            crop_top=crop_top,
+            crop_bottom=crop_bottom,
+        )
         # Use full_page=True for direct HTML extraction with HIGH_ACCURACY_BBOX_PROMPT
         predictions = recognizer([image], full_page=True)
 
@@ -371,11 +537,41 @@ async def ocr_blocks(file: UploadFile = File(...),
         le=600,
         description="Optional: DPI for rendering PDF pages to images. Higher DPI can improve OCR accuracy but increases processing time and memory usage. 300 (the default) is a common choice for good quality OCR."
         ),
+    trim: float = Query(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Entropy threshold to trim empty/solid borders before OCR. 0 disables trimming; 0.2–0.5 recommended."
+        ),
     crop: float = Query(
         default=0.0,
         ge=0.0,
         le=50.0,
         description="Optional percent to crop from each side of the image before OCR. Can help with noisy borders that can provoke hallucinations. 0 means no cropping, 50 means crop half of the image from each side, 0.2 .. 0.5 recommended value."
+        ),
+    crop_left: float = Query(
+        default=0.0,
+        ge=0.0,
+        le=50.0,
+        description="Percent to crop from the LEFT side; overrides crop for that side when non-zero."
+        ),
+    crop_right: float = Query(
+        default=0.0,
+        ge=0.0,
+        le=50.0,
+        description="Percent to crop from the RIGHT side; overrides crop for that side when non-zero."
+        ),
+    crop_top: float = Query(
+        default=0.0,
+        ge=0.0,
+        le=50.0,
+        description="Percent to crop from the TOP side; overrides crop for that side when non-zero."
+        ),
+    crop_bottom: float = Query(
+        default=0.0,
+        ge=0.0,
+        le=50.0,
+        description="Percent to crop from the BOTTOM side; overrides crop for that side when non-zero."
         ),
     # tblmode: str = Query(
     #     default="td",
@@ -391,25 +587,19 @@ async def ocr_blocks(file: UploadFile = File(...),
         logger.warning(
             f"Received file: {file.filename}, content_type: {file.content_type}"
         )
-        _, last_updated, port = get_request_count()
-        if (
-            last_updated is None
-            or port is None
-            or not probe_health(f"http://{settings.SURYA_INFERENCE_HOST}:{port}")
-        ):
-            inference_manager.stop()
-            inference_manager.start()
+        await ensure_inference_server()
         update_request_count()
         start_time = perf_counter()
-        if file.content_type == "application/pdf":
-            # For PDFs, render the first page to an image for OCR
-            image = get_page_image(file, page_num=1, dpi=dpi)
-        else:
-            image = Image.open(file.file).convert("RGB")
-        image = trim_noisy_background(image)
-        if crop > 0.0:
-            image = crop_by_percent(image, crop)
-        # image.save("/home/al/prj/ITSumma/NPZ/пример5/РД-400-18-АС-48/processed_image.png")  # Debugging line to check the processed image
+        image = load_and_preprocess_image(
+            file,
+            dpi=dpi,
+            trim=trim,
+            crop=crop,
+            crop_left=crop_left,
+            crop_right=crop_right,
+            crop_top=crop_top,
+            crop_bottom=crop_bottom,
+        )
         layout_predictor = LayoutPredictor(inference_manager)
         layouts = layout_predictor([image])
         if not layouts or not layouts[0].bboxes:
@@ -483,6 +673,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     n_workers = settings.SURYA_INFERENCE_PARALLEL or 1
+    if sys.platform == "win32":
+        # uvicorn multiprocess workers pass sockets to children via fork on
+        # Unix only; on Windows this fails with WinError 10022 at sock.listen().
+        if n_workers > 1:
+            logger.warning(
+                "Multiple uvicorn workers are not supported on Windows; using workers=1"
+            )
+        n_workers = 1
     uvicorn.run(
         "surya_api:app",
         host="0.0.0.0",

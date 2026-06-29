@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+*_test.py
+conftest.py
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# OCR scratch / local test outputs
+tl431*.json
+tl431*.html
+tl431*.txt
+tl431*.png
+
+# Backup / duplicate source copies
+*(2).py
+*(2)*
+* (2).py
+* (2)*
+
+# Logs
+*.log
